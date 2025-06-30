@@ -51,13 +51,12 @@ async function initializeDatabase() {
 // Sécurité
 app.use(helmet());
 
-// Remplacer la config CORS existante par une version multi-origine
+// Correction du middleware CORS
 const allowedOrigins = [
   'https://www.quran-pro.harrmos.com',
   'http://localhost:5173'
 ];
-app.use(
-  ({
+app.use(cors({
   origin: function(origin, callback) {
     if (!origin || allowedOrigins.includes(origin)) {
       callback(null, true);
