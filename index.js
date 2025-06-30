@@ -51,8 +51,7 @@ async function initializeDatabase() {
 // Sécurité
 app.use(helmet());
 
-// CORS
-const cors = require('cors');
+// Remplacer la config CORS existante par une version multi-origine
 const allowedOrigins = [
   'https://www.quran-pro.harrmos.com',
   'http://localhost:5173'
