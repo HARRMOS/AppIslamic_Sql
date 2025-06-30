@@ -52,8 +52,19 @@ async function initializeDatabase() {
 app.use(helmet());
 
 // CORS
+const cors = require('cors');
+const allowedOrigins = [
+  'https://www.quran-pro.harrmos.com',
+  'http://localhost:5173'
+];
 app.use(cors({
-  origin: process.env.CORS_ORIGIN || 'http://localhost:5173',
+  origin: function(origin, callback) {
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
   credentials: true
 }));
 
