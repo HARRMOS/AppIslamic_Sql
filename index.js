@@ -56,7 +56,8 @@ const allowedOrigins = [
   'https://www.quran-pro.harrmos.com',
   'http://localhost:5173'
 ];
-app.use(cors({
+app.use(
+  ({
   origin: function(origin, callback) {
     if (!origin || allowedOrigins.includes(origin)) {
       callback(null, true);
@@ -269,6 +270,51 @@ app.get('/api/stats/:userId/daily/:days', async (req, res) => {
     res.json({ success: true, stats: rows });
   } catch (error) {
     console.error('Erreur récupération stats détaillées:', error);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// Route pour les stats du jour
+app.get('/api/stats/:userId/today', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const [rows] = await pool.execute(
+      'SELECT * FROM quran_stats WHERE user_id = ? AND date = CURDATE()',
+      [userId]
+    );
+    res.json({ success: true, stats: rows });
+  } catch (error) {
+    console.error('Erreur récupération stats today:', error);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// Route pour les stats de la semaine
+app.get('/api/stats/:userId/week', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const [rows] = await pool.execute(
+      'SELECT * FROM quran_stats WHERE user_id = ? AND date >= DATE_SUB(CURDATE(), INTERVAL 6 DAY) ORDER BY date ASC',
+      [userId]
+    );
+    res.json({ success: true, stats: rows });
+  } catch (error) {
+    console.error('Erreur récupération stats week:', error);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// Route pour toutes les stats
+app.get('/api/stats/:userId/all', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const [rows] = await pool.execute(
+      'SELECT * FROM quran_stats WHERE user_id = ? ORDER BY date ASC',
+      [userId]
+    );
+    res.json({ success: true, stats: rows });
+  } catch (error) {
+    console.error('Erreur récupération stats all:', error);
     res.status(500).json({ error: 'Erreur serveur' });
   }
 });
