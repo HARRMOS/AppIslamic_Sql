@@ -47,7 +47,15 @@ async function initializeDatabase() {
 // =====================================================
 // MIDDLEWARE
 // =====================================================
-
+// === ROUTE DE TEST CONNEXION MYSQL ===
+app.get('/api/test-db', async (req, res) => {
+  try {
+    const [rows] = await pool.execute('SELECT 1');
+    res.json({ success: true, rows });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 // Sécurité
 app.use(helmet());
 
