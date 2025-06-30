@@ -669,4 +669,13 @@ process.on('SIGTERM', async () => {
 startServer().catch(error => {
   console.error('❌ Erreur au démarrage:', error);
   process.exit(1);
+});
+
+app.get('/api/test-db', async (req, res) => {
+  try {
+    const [rows] = await pool.execute('SELECT 1');
+    res.json({ success: true, rows });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 }); 
