@@ -142,7 +142,7 @@ const JWT_SECRET = process.env.JWT_SECRET || 'une_clé_ultra_secrète';
 passport.use(new GoogleStrategy({
   clientID: GOOGLE_CLIENT_ID,
   clientSecret: GOOGLE_CLIENT_SECRET,
-  callbackURL: 'https://appislamic.onrender.com/auth/google/callback',
+  callbackURL: 'https://appislamic-sql.onrender.com/auth/google/callback',
 }, async (accessToken, refreshToken, profile, done) => {
   try {
     // On crée ou récupère l'utilisateur dans la base
