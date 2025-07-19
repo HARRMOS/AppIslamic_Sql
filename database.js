@@ -9,8 +9,20 @@ const mysqlPool = mysql.createPool({
   database: 'islamicApp',
   waitForConnections: true,
   connectionLimit: 10,
-  queueLimit: 0
+  queueLimit: 0,
+  connectTimeout: 10000, // 10s
+  acquireTimeout: 10000  // 10s
 });
+
+// Ping automatique toutes les 5 minutes pour garder la connexion vivante
+setInterval(async () => {
+  try {
+    await mysqlPool.query('SELECT 1');
+    // console.log('MySQL keep-alive ping');
+  } catch (err) {
+    console.error('Erreur MySQL keep-alive ping:', err);
+  }
+}, 5 * 60 * 1000);
 
 // Fonction pour synchroniser un utilisateur vers la base MySQL (avec fetch)
 const SQL_API_URL = process.env.SQL_API_URL || (process.env.NODE_ENV === 'production'
@@ -77,19 +89,32 @@ export async function findOrCreateUser(googleId, username, email) {
       await mysqlPool.query('UPDATE users SET chatbotMessagesQuota = 1000 WHERE id = ?', [googleId]);
     }
     [rows] = await mysqlPool.query('SELECT * FROM users WHERE id = ?', [googleId]);
-    return rows[0];
+    const userFinal = rows[0];
+    // On utilise la colonne isAdmin de la base
+    userFinal.isAdmin = !!userFinal.isAdmin;
+    return userFinal;
   }
   await mysqlPool.query(
     'INSERT INTO users (id, email, username, chatbotMessagesUsed, chatbotMessagesQuota) VALUES (?, ?, ?, 0, 1000)',
     [googleId, email, username]
   );
   [rows] = await mysqlPool.query('SELECT * FROM users WHERE id = ?', [googleId]);
-  return rows[0];
+  const userFinal = rows[0];
+  userFinal.isAdmin = (userFinal.email === 'mohammadharris200528@gmail.com');
+  return userFinal;
 }
 
 export async function findUserById(id) {
-  const [rows] = await mysqlPool.query('SELECT * FROM users WHERE id = ?', [id]);
-  return rows[0] || null;
+  try {
+    const [rows] = await mysqlPool.query('SELECT * FROM users WHERE id = ?', [id]);
+    if (!rows[0]) return null;
+    const user = rows[0];
+    user.isAdmin = (user.email === 'mohammadharris200528@gmail.com');
+    return user;
+  } catch (err) {
+    console.error('Erreur MySQL dans findUserById:', err);
+    return null;
+  }
 }
 
 export async function checkGlobalChatbotQuota(userId, email) {
@@ -124,16 +149,16 @@ export async function getUserStats(userId) {
 }
 
 export async function updateConversationTitleMySQL(userId, botId, conversationId, title) {
-  try {
+    try {
     const [result] = await mysqlPool.execute(
       'UPDATE conversations SET title = ?, updatedAt = NOW() WHERE id = ? AND userId = ? AND botId = ?',
       [title, conversationId, userId, botId]
     );
     return result.affectedRows > 0;
-  } catch (err) {
+    } catch (err) {
     console.error('Erreur SQL MySQL lors du renommage:', err);
     throw err;
-  }
+    }
 }
 
 export async function deleteConversationMySQL(userId, botId, conversationId) {
@@ -144,9 +169,20 @@ export async function deleteConversationMySQL(userId, botId, conversationId) {
   return result.affectedRows > 0;
 }
 
+export async function getConversationsForUserBot(userId, botId) {
+  const [rows] = await mysqlPool.query(
+    'SELECT * FROM conversations WHERE userId = ? AND botId = ?',
+    [userId, botId]
+  );
+  return rows;
+}
+
 export async function getBotById(botId) {
-  const [rows] = await mysqlPool.query('SELECT * FROM bots WHERE id = ?', [botId]);
-  return rows[0] || null;
+  const [rows] = await mysqlPool.query(
+    'SELECT * FROM bots WHERE id = ?',
+    [botId]
+  );
+  return rows[0];
 }
 
 export async function getMessagesForUserBot(userId, botId, conversationId = 0, limit = 10) {
@@ -163,7 +199,47 @@ export async function getMessagesForUserBot(userId, botId, conversationId = 0, l
   return rows.reverse(); // Pour avoir du plus ancien au plus récent
 }
 
-export {
+export async function getUserBotPreferences(userId, botId) {
+  const [rows] = await mysqlPool.query(
+    'SELECT * FROM user_bot_preferences WHERE userId = ? AND botId = ?',
+    [userId, botId]
+  );
+  return rows[0] || null;
+}
+
+// Enregistrer un résultat de quiz
+export async function saveQuizResult(userId, theme, level, score, total, details = null, quiz_id) {
+  const date = new Date().toISOString().slice(0, 19).replace('T', ' ');
+  await mysqlPool.query(
+    'INSERT INTO quiz_results (user_id, quiz_id, theme, level, score, total, date, details) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+    [userId, quiz_id, theme, level, score, total, date, details ? JSON.stringify(details) : null]
+  );
+}
+
+// Récupérer l’historique des quiz d’un utilisateur
+export async function getQuizResultsForUser(userId) {
+  const [rows] = await mysqlPool.query(
+    'SELECT * FROM quiz_results WHERE user_id = ? ORDER BY date DESC',
+    [userId]
+  );
+  return rows;
+}
+
+export async function setMaintenance(enabled, id = '', pwd = '') {
+  await mysqlPool.query(
+    'UPDATE maintenance SET enabled = ?, admin_id = ?, admin_pwd = ? WHERE id = 1',
+    [!!enabled, id, pwd]
+  );
+}
+
+export async function getMaintenance() {
+  const [rows] = await mysqlPool.query('SELECT enabled, admin_id, admin_pwd FROM maintenance WHERE id = 1');
+  if (!rows[0]) return { enabled: false, id: '', pwd: '' };
+  return { enabled: !!rows[0].enabled, id: rows[0].admin_id || '', pwd: rows[0].admin_pwd || '' };
+}
+
+export { 
   mysqlPool,
   syncUserToMySQL
+  
 }; 

@@ -1,8 +1,8 @@
 import express from 'express';
-import passport from 'passport';
-import { Strategy as GoogleStrategy } from 'passport-google-oauth20';
 import dotenv from 'dotenv';
-import session from 'express-session';
+import { createRequire } from 'module';
+const require = createRequire(import.meta.url);
+import bodyParser from 'body-parser';
 import { 
   syncUserToMySQL,
   findOrCreateUser,
@@ -13,33 +13,108 @@ import {
   mysqlPool, // <-- Ajouté ici
   updateConversationTitleMySQL,
   deleteConversationMySQL,
+  getConversationsForUserBot, // Ajouté
   getBotById,
-  getMessagesForUserBot
+  getMessagesForUserBot, // Ajouté
+  getUserBotPreferences, // Ajouté
+  saveQuizResult,
+  getQuizResultsForUser,
+  setMaintenance,
+  getMaintenance
 } from './database.js';
 import cors from 'cors';
 import openai from './openai.js';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import jwt from 'jsonwebtoken';
+import passport from 'passport';
+import { Strategy as GoogleStrategy } from 'passport-google-oauth20';
+import fs from 'fs';
+import { OAuth2Client } from 'google-auth-library';
+const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
+
 
 dotenv.config();
 
 const app = express();
 
+// Augmente la limite de taille du body parser à 2mb
+app.use(bodyParser.json({ limit: '2mb' }));
+app.use(bodyParser.urlencoded({ limit: '2mb', extended: true }));
+
+// Désactive l'ETag globalement pour éviter les 304 (important pour Safari/cookies)
+app.disable('etag');
+
 app.set('trust proxy', 1);
 
-// Middleware pour vérifier l'authentification
-function isAuthenticated(req, res, next) {
-  if (req.isAuthenticated()) {
+// Middleware pour vérifier le JWT dans l'en-tête Authorization
+function authenticateJWT(req, res, next) {
+  if (req.method === 'OPTIONS') {
     return next();
   }
-  res.status(401).json({ message: 'Non authentifié' });
+  const authHeader = req.headers['authorization'];
+  console.log('--- [AUTH] ---');
+  console.log('Authorization header reçu:', authHeader);
+  if (!authHeader) {
+    console.log('Aucun header Authorization reçu');
+    return res.status(401).json({ message: 'Token manquant' });
+  }
+  const token = authHeader.split(' ')[1];
+  console.log('Token extrait:', token);
+  if (!token) {
+    console.log('Header Authorization mal formé');
+    return res.status(401).json({ message: 'Token manquant' });
+  }
+  const JWT_SECRET = process.env.JWT_SECRET || 'une_clé_ultra_secrète';
+  jwt.verify(token, JWT_SECRET, async (err, decoded) => {
+    if (err) {
+      console.log('Erreur de vérification JWT:', err.message);
+      return res.status(401).json({ message: 'Token invalide ou expiré', error: err.message });
+    }
+    console.log('Payload décodé:', decoded);
+    // On peut aller chercher l'utilisateur en base si besoin
+    const user = await findUserById(decoded.id);
+    if (!user) {
+      console.log('Utilisateur non trouvé pour l’ID:', decoded.id);
+      return res.status(404).json({ message: 'Utilisateur non trouvé' });
+    }
+    console.log('Utilisateur trouvé:', user.id, user.email);
+    req.user = user;
+    next();
+  });
 }
 
-// Configurer CORS pour autoriser les requêtes depuis le frontend
-app.use(cors({
-  origin: ['http://localhost:5173', 'http://www.quran-pro.harrmos.com', 'https://www.quran-pro.harrmos.com'],
-  credentials: true
-}));
+// Middleware pour vérifier l'admin
+function requireAdmin(req, res, next) {
+  if (!req.user || !req.user.isAdmin) {
+    return res.status(403).json({ message: 'Accès réservé à l’admin' });
+  }
+  next();
+}
+
+const allowedOrigins = [
+  'https://www.quran-pro.harrmos.com',
+  'https://www.ummati.pro',
+  'https://quran-pro.harrmos.com',
+  'https://ummati.pro',
+  'https://appislamic.onrender.com',
+  
+  // Ajoute ici d'autres domaines si besoin (Vercel, Netlify, etc.)
+];
+
+const corsOptions = {
+  origin: function (origin, callback) {
+    console.log('CORS origin:', origin);
+    // Autorise les requêtes sans origin (ex: mobile, redirection OAuth)
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+  credentials: true,
+};
+app.use(cors(corsOptions));
 
 // Ajouter le middleware pour parser le JSON
 app.use(express.json());
@@ -51,72 +126,40 @@ console.log('RENDER:', process.env.RENDER);
 console.log('PORT:', process.env.PORT);
 console.log('========================');
 
+
 // Configurer le middleware de session
-app.use(session({
-  secret: process.env.SESSION_SECRET || 'supersecretpar défaut',
-  resave: false,
-  saveUninitialized: false,
-  cookie: {
-    secure: false,
-    sameSite: 'Lax',
-    maxAge: 24 * 60 * 60 * 1000 // 24 heures
+
+
+// Ajout de logs pour la configuration de session
+
+
+// Configure Google OAuth strategy
+
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
+const JWT_SECRET = process.env.JWT_SECRET || 'une_clé_ultra_secrète';
+
+passport.use(new GoogleStrategy({
+  clientID: GOOGLE_CLIENT_ID,
+  clientSecret: GOOGLE_CLIENT_SECRET,
+  callbackURL: 'https://appislamic.onrender.com/auth/google/callback',
+}, async (accessToken, refreshToken, profile, done) => {
+  try {
+    // On crée ou récupère l'utilisateur dans la base
+    const user = await findOrCreateUser(profile.id, profile.displayName, profile.emails[0].value);
+    return done(null, user);
+  } catch (err) {
+    return done(err, null);
   }
 }));
 
-// Ajout de logs pour la configuration de session
-console.log('Configuration de session:', {
-  secret: process.env.SESSION_SECRET || 'supersecretpar défaut',
-  secure: true,
-  sameSite: 'None',
-  maxAge: 24 * 60 * 60 * 1000
-});
-
-// Configure Google OAuth strategy
-passport.use(new GoogleStrategy({
-    clientID: process.env.GOOGLE_CLIENT_ID,
-    clientSecret: process.env.GOOGLE_CLIENT_SECRET,
-    callbackURL: process.env.GOOGLE_CALLBACK_URL || "http://localhost:3000/auth/google/callback"
-  },
-  async (accessToken, refreshToken, profile, done) => {
-    try {
-      const user = await findOrCreateUser(profile.id, profile.displayName, profile.emails[0].value);
-      if (!user) {
-        // Si la synchro MySQL a échoué, refuser la connexion
-        return done(null, false);
-      }
-      done(null, user);
-    } catch (err) {
-      console.error('Erreur dans la stratégie Google:', err);
-      done(err);
-    }
-  }
-));
+app.use(passport.initialize());
 
 // Initialiser Passport et la gestion de session
-app.use(passport.initialize());
-app.use(passport.session());
+
 
 // Sérialisation et désérialisation de l'utilisateur (déplacées depuis database.js)
-passport.serializeUser((user, done) => {
-  console.log('Passport: server.js - serializeUser - User ID:', user.id);
-  done(null, user.id);
-});
 
-passport.deserializeUser(async (id, done) => {
-  try {
-    const user = await findUserById(id);
-    if (user) {
-      console.log('Passport: server.js - deserializeUser - User found, calling done(null, user)');
-      done(null, user);
-    } else {
-      console.log('Passport: server.js - deserializeUser - User not found for ID', id, ', calling done(null, false)');
-      done(null, false);
-    }
-  } catch (err) {
-    console.error('Passport: server.js - deserializeUser - Error during deserialization:', err);
-    done(err);
-  }
-});
 
 // Initialiser la base de données au démarrage du serveur
 
@@ -128,32 +171,25 @@ async function addMessageMySQL(userId, botId, conversationId, sender, text, cont
   );
 }
 
+// Désactive le cache pour la route /auth/status (important pour Safari/cookies)
+app.use('/auth/status', (req, res, next) => {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.set('Pragma', 'no-cache');
+  res.set('Expires', '0');
+  res.set('Surrogate-Control', 'no-store');
+  next();
+});
 // Route pour vérifier l'état de l'authentification (pour le frontend)
-app.get('/auth/status', async (req, res) => {
-  console.log('=== Début de la requête /auth/status ===');
-  console.log('Headers:', req.headers);
-  console.log('Raw Cookie Header:', req.headers.cookie);
-  console.log('Cookies:', req.cookies);
-  console.log('Session:', req.session);
-  console.log('isAuthenticated:', req.isAuthenticated());
-  console.log('User:', req.user);
-
-  if (req.isAuthenticated()) {
-    console.log('Utilisateur authentifié, ID:', req.user.id);
-    const responseUser = { 
-      id: req.user.id, 
-      name: req.user.name, 
-      email: req.user.email, 
-      mysql_id: req.user.mysql_id
-    };
-    console.log('/auth/status - Envoi de la réponse user (authentifié): ', responseUser);
-    res.status(200).json({ user: responseUser });
-  } else {
-    console.log('Utilisateur non authentifié');
-    console.log('/auth/status - Envoi de la réponse user (non authentifié): ', null);
-    res.status(200).json({ user: null });
-  }
-  console.log('=== Fin de la requête /auth/status ===');
+app.get('/auth/status', authenticateJWT, async (req, res) => {
+  const responseUser = {
+    id: req.user.id,
+    name: req.user.name || req.user.username,
+    email: req.user.email,
+    username: req.user.username, // Ajouté
+    profile_picture: req.user.profile_picture, // Ajouté
+    mysql_id: req.user.mysql_id
+  };
+  res.status(200).json({ user: responseUser });
 });
 
 // Route pour initier l'authentification Google
@@ -162,35 +198,22 @@ app.get('/auth/google',
 );
 // Route de callback après l'authentification Google
 app.get('/auth/google/callback',
-  passport.authenticate('google', { failureRedirect: '/login' }),
+  passport.authenticate('google', { session: false, failureRedirect: '/login' }),
   (req, res) => {
-    // Répondre en 200 avec un HTML qui redirige côté client (pour que le cookie soit bien set)
-    const frontendUrl = 'http://localhost:5173/';
-    res.send(`
-      <html>
-        <head>
-          <meta http-equiv="refresh" content="0;url=${frontendUrl}" />
-          <script>window.location.href = "${frontendUrl}";</script>
-        </head>
-        <body>
-          Redirection...
-        </body>
-      </html>
-    `);
+    // Générer un JWT pour l'utilisateur connecté
+    const token = jwt.sign(
+      { id: req.user.id, email: req.user.email },
+      JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+    // Rediriger vers le frontend avec le token en query (à adapter selon ton frontend)
+    res.redirect(`https://www.ummati.pro/auth/callback?token=${token}`);
   }
 );
 
 // Route de déconnexion
-app.get('/logout', (req, res, next) => {
-  console.log('Received logout request');
-  req.logout((err) => {
-    if (err) {
-      console.error('Erreur lors de la déconnexion:', err);
-      return next(err);
-    }
-    // Au lieu de rediriger, envoyer une réponse JSON pour le frontend
-    res.status(200).json({ message: 'Déconnexion réussie' });
-  });
+app.get('/logout', (req, res) => {
+  res.status(200).json({ message: 'Déconnexion réussie (stateless JWT)' });
 });
 
 // ===================== ROUTES UTILISATEURS =====================
@@ -242,24 +265,30 @@ app.get('/api/users/:userId', async (req, res) => {
     res.status(500).json({ error: 'Erreur serveur' });
   }
 });
-app.put('/api/users/:userId/preferences', isAuthenticated, async (req, res) => {
+app.put('/api/users/:userId/preferences', authenticateJWT, async (req, res) => {
   try {
-    const { userId } = req.params;
+    const userId = req.user.id;
     const { preferences } = req.body;
-    const [result] = await mysqlPool.execute(
+    console.log('userId:', userId, typeof userId, 'params:', req.params.userId, typeof req.params.userId);
+    if (!preferences) {
+      return res.status(400).json({ success: false, message: 'Préférences manquantes' });
+    }
+    // Vérifier que l'utilisateur modifie bien ses propres préférences (comparaison en string)
+    if (String(userId) !== String(req.params.userId)) {
+      return res.status(403).json({ success: false, message: 'Accès interdit' });
+    }
+    console.log('UPDATE preferences for user', userId, preferences);
+    await mysqlPool.execute(
       'UPDATE users SET preferences = ? WHERE id = ?',
       [JSON.stringify(preferences), userId]
     );
-    if (result.affectedRows === 0) {
-      return res.status(404).json({ error: 'Utilisateur non trouvé' });
-    }
-    res.json({ success: true, message: 'Préférences mises à jour' });
+    res.json({ success: true, message: 'Préférences mises à jour.' });
   } catch (error) {
-    res.status(500).json({ error: 'Erreur serveur' });
+    res.status(500).json({ success: false, message: 'Erreur lors de la mise à jour des préférences.' });
   }
 });
 // ===================== ROUTES STATISTIQUES =====================
-app.post('/api/stats', isAuthenticated, async (req, res) => {
+app.post('/api/stats', authenticateJWT, async (req, res) => {
   console.log('POST /api/stats', req.body);
   try {
     const { userId, hasanat = 0, verses = 0, time = 0, pages = 0 } = req.body;
@@ -293,7 +322,7 @@ app.post('/api/stats', isAuthenticated, async (req, res) => {
   }
 });
 // ===================== ROUTES PROGRESSION =====================
-app.post('/api/progress', isAuthenticated, async (req, res) => {
+app.post('/api/progress', authenticateJWT, async (req, res) => {
   try {
     const { userId, surah, ayah } = req.body;
     const [result] = await mysqlPool.execute(
@@ -305,7 +334,10 @@ app.post('/api/progress', isAuthenticated, async (req, res) => {
     res.status(500).json({ error: 'Erreur lors de la sauvegarde' });
   }
 });
-app.get('/api/progress/:userId', isAuthenticated, async (req, res) => {
+app.get('/api/progress/:userId', authenticateJWT, async (req, res) => {
+  if (req.user.id !== req.params.userId) {
+    return res.status(403).json({ message: 'Accès interdit' });
+  }
   try {
     const { userId } = req.params;
     const [rows] = await mysqlPool.execute(
@@ -318,7 +350,7 @@ app.get('/api/progress/:userId', isAuthenticated, async (req, res) => {
   }
 });
 // ===================== ROUTES HISTORIQUE =====================
-app.post('/api/history', isAuthenticated, async (req, res) => {
+app.post('/api/history', authenticateJWT, async (req, res) => {
   try {
     const { userId, surah, ayah, actionType, duration = 0 } = req.body;
     const [result] = await mysqlPool.execute(
@@ -330,7 +362,10 @@ app.post('/api/history', isAuthenticated, async (req, res) => {
     res.status(500).json({ error: 'Erreur serveur' });
   }
 });
-app.get('/api/history/:userId/:limit', isAuthenticated, async (req, res) => {
+app.get('/api/history/:userId/:limit', authenticateJWT, async (req, res) => {
+  if (req.user.id !== req.params.userId) {
+    return res.status(403).json({ message: 'Accès interdit' });
+  }
   try {
     const { userId, limit } = req.params;
     const limitNum = Math.min(parseInt(limit) || 50, 100);
@@ -348,9 +383,10 @@ app.get('/api/history/:userId/:limit', isAuthenticated, async (req, res) => {
   }
 });
 // ===================== ROUTES FAVORIS =====================
-app.post('/api/favorites', isAuthenticated, async (req, res) => {
+app.post('/api/favorites', authenticateJWT, async (req, res) => {
   try {
-    const { userId, type, referenceId, referenceText, notes } = req.body;
+    const userId = req.user.id;
+    const { type, referenceId, referenceText, notes } = req.body;
     const [result] = await mysqlPool.execute(
       'INSERT INTO favorites (user_id, type, reference_id, reference_text, notes) VALUES (?, ?, ?, ?, ?)',
       [userId, type, referenceId, referenceText, notes]
@@ -360,7 +396,10 @@ app.post('/api/favorites', isAuthenticated, async (req, res) => {
     res.status(500).json({ error: 'Erreur serveur' });
   }
 });
-app.get('/api/favorites/:userId', isAuthenticated, async (req, res) => {
+app.get('/api/favorites/:userId', authenticateJWT, async (req, res) => {
+  if (req.user.id !== req.params.userId) {
+    return res.status(403).json({ message: 'Accès interdit' });
+  }
   try {
     const { userId } = req.params;
     const [rows] = await mysqlPool.execute(
@@ -372,7 +411,7 @@ app.get('/api/favorites/:userId', isAuthenticated, async (req, res) => {
     res.status(500).json({ error: 'Erreur serveur' });
   }
 });
-app.delete('/api/favorites/:favoriteId', isAuthenticated, async (req, res) => {
+app.delete('/api/favorites/:favoriteId', authenticateJWT, async (req, res) => {
   try {
     const { favoriteId } = req.params;
     const [result] = await mysqlPool.execute(
@@ -388,7 +427,7 @@ app.delete('/api/favorites/:favoriteId', isAuthenticated, async (req, res) => {
   }
 });
 // ===================== ROUTES SESSIONS =====================
-app.post('/api/sessions/start', isAuthenticated, async (req, res) => {
+app.post('/api/sessions/start', authenticateJWT, async (req, res) => {
   try {
     const { userId, deviceInfo } = req.body;
     const [result] = await mysqlPool.execute(
@@ -400,7 +439,7 @@ app.post('/api/sessions/start', isAuthenticated, async (req, res) => {
     res.status(500).json({ error: 'Erreur serveur' });
   }
 });
-app.put('/api/sessions/:sessionId/end', isAuthenticated, async (req, res) => {
+app.put('/api/sessions/:sessionId/end', authenticateJWT, async (req, res) => {
   try {
     const { sessionId } = req.params;
     const { versesRead, hasanatEarned } = req.body;
@@ -422,9 +461,10 @@ app.put('/api/sessions/:sessionId/end', isAuthenticated, async (req, res) => {
   }
 });
 // ===================== ROUTES OBJECTIFS =====================
-app.post('/api/goals', isAuthenticated, async (req, res) => {
+app.post('/api/goals', authenticateJWT, async (req, res) => {
   try {
-    const { userId, goalType, targetValue, startDate, endDate } = req.body;
+    const userId = req.user.id;
+    const { goalType, targetValue, startDate, endDate } = req.body;
     const [result] = await mysqlPool.execute(
       'INSERT INTO reading_goals (user_id, goal_type, target_value, start_date, end_date) VALUES (?, ?, ?, ?, ?)',
       [userId, goalType, targetValue, startDate, endDate]
@@ -434,7 +474,10 @@ app.post('/api/goals', isAuthenticated, async (req, res) => {
     res.status(500).json({ error: 'Erreur serveur' });
   }
 });
-app.get('/api/goals/:userId', isAuthenticated, async (req, res) => {
+app.get('/api/goals/:userId', authenticateJWT, async (req, res) => {
+  if (req.user.id !== req.params.userId) {
+    return res.status(403).json({ message: 'Accès interdit' });
+  }
   try {
     const { userId } = req.params;
     const [rows] = await mysqlPool.execute(
@@ -446,27 +489,30 @@ app.get('/api/goals/:userId', isAuthenticated, async (req, res) => {
     res.status(500).json({ error: 'Erreur serveur' });
   }
 });
-app.put('/api/goals/:goalId', isAuthenticated, async (req, res) => {
+app.put('/api/goals/:goalId', authenticateJWT, async (req, res) => {
   try {
+    const userId = req.user.id;
     const { goalId } = req.params;
     const { currentValue, isCompleted } = req.body;
+    // Vérifier que l'objectif appartient à l'utilisateur
+    const [rows] = await mysqlPool.execute('SELECT * FROM reading_goals WHERE id = ? AND user_id = ?', [goalId, userId]);
+    if (!rows.length) {
+      return res.status(404).json({ error: 'Objectif non trouvé' });
+    }
     const [result] = await mysqlPool.execute(
       'UPDATE reading_goals SET current_value = ?, is_completed = ? WHERE id = ?',
       [currentValue, isCompleted, goalId]
     );
-    if (result.affectedRows === 0) {
-      return res.status(404).json({ error: 'Objectif non trouvé' });
-    }
     res.json({ success: true, message: 'Objectif mis à jour' });
   } catch (error) {
     res.status(500).json({ error: 'Erreur serveur' });
   }
 });
 
-// Nouvelle route pour récupérer tous les bots
-app.get('/api/bots', (req, res) => {
+// Correction de la route GET /api/bots si getBots est async
+app.get('/api/bots', async (req, res) => {
   try {
-    const bots = getBots();
+    const bots = await getBots();
     res.status(200).json(bots);
   } catch (error) {
     console.error('Erreur lors de la récupération des bots:', error);
@@ -506,6 +552,195 @@ app.get('/api/bots', (req, res) => {
 //   }
 // });
 
+
+
+// ===================== ROUTES EVENEMENTS CALENDRIER =====================
+// Liste tous les événements (publique)
+app.get('/api/events', async (req, res) => {
+  try {
+    const [rows] = await mysqlPool.execute('SELECT * FROM islamic_events ORDER BY date ASC');
+    res.json({ events: rows });
+  } catch (error) {
+    res.status(500).json({ error: 'Erreur lors de la récupération des événements', details: error.message });
+  }
+});
+// Ajout d'un événement (admin)
+app.post('/api/events', authenticateJWT, requireAdmin, async (req, res) => {
+  try {
+    const { date, name, icon, description } = req.body;
+    if (!date || !name) {
+      return res.status(400).json({ error: 'Date et nom obligatoires' });
+    }
+    await mysqlPool.execute(
+      'INSERT INTO islamic_events (date, name, icon, description) VALUES (?, ?, ?, ?)',
+      [date, name, icon || '', description || '']
+    );
+    res.status(201).json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Erreur lors de l\'ajout de l\'événement', details: error.message });
+  }
+});
+// Suppression d'un événement (admin)
+app.delete('/api/events/:id', authenticateJWT, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    await mysqlPool.execute('DELETE FROM islamic_events WHERE id = ?', [id]);
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Erreur lors de la suppression de l\'événement', details: error.message });
+  }
+}); 
+
+
+
+// ===================== CRUD DUA =====================
+
+// Récupérer toutes les duas
+app.get('/api/duas', authenticateJWT, requireAdmin, async (req, res) => {
+  try {
+    const [rows] = await mysqlPool.execute('SELECT * FROM duas ORDER BY created_at DESC');
+    res.json({ duas: rows });
+  } catch (error) {
+    res.status(500).json({ message: 'Erreur lors de la récupération des duas.' });
+  }
+});
+
+// Ajouter une dua
+app.post('/api/duas', authenticateJWT, requireAdmin, async (req, res) => {
+  const { title, arabic, translit, translation, category, audio } = req.body;
+  if (!title || !arabic || !translation) {
+    return res.status(400).json({ message: 'Champs obligatoires manquants.' });
+  }
+  try {
+    const [result] = await mysqlPool.execute(
+      'INSERT INTO duas (title, arabic, translit, translation, category, audio) VALUES (?, ?, ?, ?, ?, ?)',
+      [title, arabic, translit || '', translation, category || 'other', audio || '']
+    );
+    res.status(201).json({ success: true, id: result.insertId });
+  } catch (error) {
+    res.status(500).json({ message: 'Erreur lors de l’ajout de la dua.' });
+  }
+});
+
+// Supprimer une dua
+app.delete('/api/duas/:id', authenticateJWT, requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  try {
+    await mysqlPool.execute('DELETE FROM duas WHERE id = ?', [id]);
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ message: 'Erreur lors de la suppression.' });
+  }
+});
+// Route pour activer/désactiver la maintenance (admin uniquement)
+app.post('/api/maintenance', authenticateJWT, requireAdmin, async (req, res) => {
+  const { enabled, id, pwd } = req.body;
+  try {
+    await setMaintenance(enabled, id, pwd);
+    res.json({ success: true, maintenance: { enabled, id, pwd } });
+  } catch (e) {
+    console.error('Erreur SQL maintenance:', e);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// Route pour lire l'état maintenance
+app.get('/api/maintenance-status', async (req, res) => {
+  try {
+    const data = await getMaintenance();
+    res.json(data);
+  } catch (e) {
+    res.json({ enabled: false, id: '', pwd: '' });
+  }
+}); 
+
+// ===================== ROUTES QUIZZES =====================
+// Liste tous les quiz
+app.get('/api/quizzes', authenticateJWT, async (req, res) => {
+  try {
+    const [rows] = await mysqlPool.execute('SELECT * FROM quizzes ORDER BY created_at DESC');
+    res.json({ success: true, quizzes: rows });
+  } catch (error) {
+    res.status(500).json({ error: 'Erreur lors de la récupération des quiz', details: error.message });
+  }
+});
+// Détail d'un quiz
+app.get('/api/quizzes/:id', authenticateJWT, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const [rows] = await mysqlPool.execute('SELECT * FROM quizzes WHERE id = ?', [id]);
+    if (!rows.length) return res.status(404).json({ error: 'Quiz non trouvé' });
+    res.json({ success: true, quiz: rows[0] });
+  } catch (error) {
+    res.status(500).json({ error: 'Erreur lors de la récupération du quiz', details: error.message });
+  }
+});
+// Création d'un quiz (admin)
+app.post('/api/quizzes', authenticateJWT, requireAdmin, async (req, res) => {
+  try {
+    const { theme, difficulty, title, description, questions } = req.body;
+    if (!theme || !difficulty || !title || !questions) {
+      return res.status(400).json({ error: 'Paramètres manquants' });
+    }
+    const [result] = await mysqlPool.execute(
+      'INSERT INTO quizzes (theme, difficulty, title, description, questions) VALUES (?, ?, ?, ?, ?)',
+      [theme, difficulty, title, description || '', JSON.stringify(questions)]
+    );
+    res.status(201).json({ success: true, quizId: result.insertId });
+  } catch (error) {
+    res.status(500).json({ error: 'Erreur lors de la création du quiz', details: error.message });
+  }
+});
+// Edition d'un quiz (admin)
+app.put('/api/quizzes/:id', authenticateJWT, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { theme, difficulty, title, description, questions } = req.body;
+    const [result] = await mysqlPool.execute(
+      'UPDATE quizzes SET theme=?, difficulty=?, title=?, description=?, questions=?, updated_at=NOW() WHERE id=?',
+      [theme, difficulty, title, description || '', JSON.stringify(questions), id]
+    );
+    if (result.affectedRows === 0) return res.status(404).json({ error: 'Quiz non trouvé' });
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Erreur lors de la modification du quiz', details: error.message });
+  }
+});
+// Suppression d'un quiz (admin)
+app.delete('/api/quizzes/:id', authenticateJWT, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const [result] = await mysqlPool.execute('DELETE FROM quizzes WHERE id = ?', [id]);
+    if (result.affectedRows === 0) return res.status(404).json({ error: 'Quiz non trouvé' });
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Erreur lors de la suppression du quiz', details: error.message });
+  }
+}); 
+
+// ===================== ROUTES QUIZ =====================
+app.get('/api/quiz/history', authenticateJWT, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const results = await getQuizResultsForUser(userId);
+    res.json({ success: true, history: results });
+  } catch (error) {
+    res.status(500).json({ error: 'Erreur lors de la récupération de l’historique', details: error.message });
+  }
+});
+app.post('/api/quiz/result', authenticateJWT, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { theme, level, score, total, details, quiz_id } = req.body;
+    if (!theme || !level || score === undefined || total === undefined || !quiz_id) {
+      return res.status(400).json({ error: 'Paramètres manquants' });
+    }
+    await saveQuizResult(userId, theme, level, score, total, details, quiz_id);
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Erreur lors de l’enregistrement du résultat', details: error.message });
+  }
+});
 //Route pour les stats du jour
  app.get('/api/stats/:userId/today', async (req, res) => {
    try {
@@ -520,15 +755,12 @@ app.get('/api/bots', (req, res) => {
      res.status(500).json({ error: 'Erreur serveur' });
    }
 });
-// Route pour créer un nouveau bot
-app.post('/api/bots', (req, res) => {
-  if (!req.isAuthenticated()) {
-    return res.status(401).json({ message: 'Non authentifié' });
-  }
+// Route pour créer un nouveau bot (admin uniquement)
+app.post('/api/bots', authenticateJWT, requireAdmin, async (req, res) => {
   const { name, description, price, category, image, prompt } = req.body;
   
   try {
-    const botId = addBot(name, description, price, category, image, prompt);
+    const botId = await addBot(name, description, price, category, image, prompt);
     res.status(201).json({ message: 'Bot créé avec succès', botId });
   } catch (error) {
     console.error('Erreur lors de la création du bot:', error);
@@ -536,18 +768,12 @@ app.post('/api/bots', (req, res) => {
   }
 });
 
-// Route pour mettre à jour un bot
-app.put('/api/bots/:id', (req, res) => {
-  if (!req.isAuthenticated()) {
-    return res.status(401).json({ message: 'Non authentifié' });
-  }
-  const botId = Number(req.params.id); // Convertir l'ID en nombre
-  console.log('PUT /api/bots/:id - Received ID:', botId); // Log the received ID
+// Correction de la route PUT /api/bots/:id pour requireAdmin
+app.put('/api/bots/:id', authenticateJWT, requireAdmin, async (req, res) => {
+  const botId = Number(req.params.id);
   const { name, description, price, category, image, prompt } = req.body;
-  console.log('PUT /api/bots/:id - Received body:', req.body); // Log the received body
-  
   try {
-    updateBot(botId, name, description, price, category, image, prompt);
+    await updateBot(botId, name, description, price, category, image, prompt);
     res.status(200).json({ message: 'Bot mis à jour avec succès' });
   } catch (error) {
     console.error('Erreur lors de la mise à jour du bot:', error);
@@ -555,15 +781,12 @@ app.put('/api/bots/:id', (req, res) => {
   }
 });
 
-// Route pour supprimer un bot
-app.delete('/api/bots/:id', (req, res) => {
-  if (!req.isAuthenticated()) {
-    return res.status(401).json({ message: 'Non authentifié' });
-  }
+// Correction de la route DELETE /api/bots/:id pour requireAdmin
+app.delete('/api/bots/:id', authenticateJWT, requireAdmin, async (req, res) => {
   const botId = req.params.id;
   
   try {
-    deleteBot(botId);
+    await deleteBot(botId);
     res.status(200).json({ message: 'Bot supprimé avec succès' });
   } catch (error) {
     console.error('Erreur lors de la suppression du bot:', error);
@@ -575,25 +798,14 @@ app.delete('/api/bots/:id', (req, res) => {
 
 
 // Nouvelle route pour récupérer les messages pour un utilisateur et un bot spécifiques
-app.get('/api/messages', async (req, res) => {
+app.get('/api/messages', authenticateJWT, async (req, res) => {
   console.log('=== Début de la requête /api/messages ===');
   console.log('Headers:', req.headers);
   console.log('Cookies:', req.cookies);
   console.log('Session (avant Passport): ', req.session);
-  console.log('isAuthenticated (après Passport): ', req.isAuthenticated());
-  console.log('User (après Passport): ', req.user);
-
-  // Commenter temporairement la vérification d'authentification
-  // if (!req.isAuthenticated()) {
-  //   console.log('/api/messages - Non authentifié après Passport');
-  //   return res.status(401).json({ message: 'Non authentifié' });
-  // }
-
-  console.log('/api/messages - Authentifié (vérification temporairement désactivée) ou non authentifié');
-  const userId = req.query.userId;
+  // Utilisateur authentifié via JWT
+  const userId = req.user.id;
   const botId = Number(req.query.botId);
-
-  // Récupérer l'identifiant de conversation, utiliser 0 par défaut si non spécifié
   const conversationId = Number(req.query.conversationId) || 0;
 
   if (!userId || isNaN(botId)) {
@@ -613,26 +825,25 @@ app.get('/api/messages', async (req, res) => {
 });
 
 // Route pour interagir avec l'API OpenAI (renommée en /api/chat)
-app.post('/api/chat', async (req, res) => {
+app.post('/api/chat', authenticateJWT, async (req, res) => {
   console.log('=== Début de la requête /api/chat ===');
   console.log('Headers:', req.headers);
   console.log('Cookies:', req.cookies);
   console.log('Session (avant Passport): ', req.session);
-  console.log('isAuthenticated (après Passport): ', req.isAuthenticated());
-  console.log('User (après Passport): ', req.user);
+  // On n'utilise plus Passport ici
+  // console.log('isAuthenticated (après Passport): ', req.isAuthenticated());
+  // console.log('User (après Passport): ', req.user);
 
-  if (!req.isAuthenticated()) {
-    console.log('/api/chat - Non authentifié après Passport');
-    return res.status(401).json({ message: 'Non authentifié' });
-  }
+  // Utilisateur authentifié via JWT
+  const userId = req.user.id;
+  console.log('/api/chat - Utilisateur authentifié, ID:', userId);
 
   // Vérification du quota global de messages chatbot
-  const quota = await checkGlobalChatbotQuota(req.user.id, req.user.email);
+  const quota = await checkGlobalChatbotQuota(userId, req.user.email);
   if (!quota.canSend) {
     return res.status(402).json({ message: `Quota de messages gratuits dépassé. Veuillez acheter plus de messages pour continuer à utiliser le chatbot.` });
   }
 
-  console.log('/api/chat - Utilisateur authentifié, ID:', req.user.id);
   const { message, botId, conversationId, title } = req.body;
   const usedBotId = botId ? Number(botId) : 1;
 
@@ -649,7 +860,7 @@ app.post('/api/chat', async (req, res) => {
       // Création de la conversation dans MySQL
       const [result] = await mysqlPool.execute(
         'INSERT INTO conversations (userId, botId, title) VALUES (?, ?, ?)',
-        [req.user.id, usedBotId, newConvTitle]
+        [userId, usedBotId, newConvTitle]
       );
       currentConversationId = result.insertId;
       console.log('Nouvelle conversation créée avec ID (MySQL):', currentConversationId);
@@ -659,7 +870,7 @@ app.post('/api/chat', async (req, res) => {
     }
   } else if (title && currentConversationId > 0) {
     try {
-      await updateConversationTitle(req.user.id, usedBotId, Number(conversationId), title);
+      await updateConversationTitle(userId, usedBotId, Number(conversationId), title);
       console.log(`Titre de la conversation ${currentConversationId} mis à jour.`);
     } catch (titleUpdateError) {
       console.error(`Erreur lors de la mise à jour du titre de la conversation ${currentConversationId}:`, titleUpdateError);
@@ -667,17 +878,12 @@ app.post('/api/chat', async (req, res) => {
   }
 
   try {
-    // Récupérer le bot pour obtenir le prompt
-    const bot = getBotById(usedBotId);
-
-    if (!bot) {
-      return res.status(404).json({ message: 'Bot non trouvé' });
-    }
-
-    const prompt = bot.prompt || 'You are a helpful assistant.';
+    // const bot = getBotById(usedBotId);
+    // const prompt = bot.prompt || 'You are a helpful assistant.';
+    const prompt = `Tu es un assistant islamique bienveillant. Tu expliques l'islam avec douceur, sagesse et respect. Tu cites toujours tes sources : versets du Coran (avec numéro de sourate et verset), hadiths authentiques (avec référence), ou avis de savants connus. Si tu ne connais pas la réponse, dis-le avec bienveillance. Tu t'exprimes comme un ami proche, rassurant et sincère. Et tu ne réponds à aucune question qui n'est pas islamique.`;
 
     // Récupérer les 10 derniers messages pour le contexte de cette conversation
-    const conversationHistory = await getMessagesForUserBot(req.user.id, usedBotId, currentConversationId, 10);
+    const conversationHistory = await getMessagesForUserBot(userId, usedBotId, currentConversationId, 10);
 
     const messagesForGpt = [
       { role: "system", content: prompt }
@@ -703,11 +909,11 @@ app.post('/api/chat', async (req, res) => {
 
     const reply = completion.choices[0].message.content;
 
-    await addMessageMySQL(req.user.id, usedBotId, currentConversationId, 'user', message);
-    await addMessageMySQL(req.user.id, usedBotId, currentConversationId, 'bot', reply);
+    await addMessageMySQL(userId, usedBotId, currentConversationId, 'user', message);
+    await addMessageMySQL(userId, usedBotId, currentConversationId, 'bot', reply);
 
     // Incrémenter le compteur de messages chatbot
-    incrementChatbotMessagesUsed(req.user.id);
+    incrementChatbotMessagesUsed(userId);
 
     res.status(200).json({ message: reply });
 
@@ -723,12 +929,11 @@ app.post('/api/chat', async (req, res) => {
 });
 
 // Route pour récupérer le quota de messages chatbot restant
-app.get('/api/chatbot/quota', async (req, res) => {
-  if (!req.isAuthenticated()) {
-    return res.status(401).json({ message: 'Non authentifié' });
-  }
+app.get('/api/chatbot/quota', authenticateJWT, async (req, res) => {
+  // Utilisateur authentifié via JWT
+  const userId = req.user.id;
   // Aller chercher l'utilisateur dans MySQL
-  const [rows] = await mysqlPool.query('SELECT chatbotMessagesUsed, chatbotMessagesQuota FROM users WHERE id = ?', [req.user.id]);
+  const [rows] = await mysqlPool.query('SELECT chatbotMessagesUsed, chatbotMessagesQuota FROM users WHERE id = ?', [userId]);
   if (!rows[0]) return res.status(404).json({ message: 'Utilisateur non trouvé' });
   const used = rows[0].chatbotMessagesUsed ?? 0;
   const quota = rows[0].chatbotMessagesQuota ?? 1000;
@@ -760,8 +965,8 @@ app.use((err, req, res, next) => {
 });
 
 // Nouvelle route pour générer des clés d'activation (pour l'administrateur)
-app.post('/api/generate-keys', (req, res) => {
-  if (!req.isAuthenticated() || req.user.email !== 'mohammadharris200528@gmail.com') { // Vérifier si l'utilisateur est admin
+app.post('/api/generate-keys', authenticateJWT, async (req, res) => {
+  if (req.user.email !== 'mohammadharris200528@gmail.com') { // Vérifier si l'utilisateur est admin
     return res.status(403).json({ message: 'Accès refusé. Réservé à l\'administrateur.' });
   }
 
@@ -786,17 +991,20 @@ app.post('/api/generate-keys', (req, res) => {
   }
 });
 
+// Harmonisation des préférences utilisateur :
+// Supprimer PUT /api/users/:userId/preferences (doublon)
 // Nouvelle route pour sauvegarder les préférences utilisateur par bot
-app.post('/api/bot-preferences', isAuthenticated, (req, res) => {
+app.post('/api/bot-preferences', authenticateJWT, async (req, res) => {
   const userId = req.user.id;
-  const { botId, preferences } = req.body;
+  const botId = Number(req.query.botId) || 1; // On force le bot islamique
+  const { preferences } = req.body;
 
-  if (!botId || !preferences) {
-    return res.status(400).json({ message: 'Bot ID et préférences sont requis.' });
+  if (!preferences) {
+    return res.status(400).json({ message: 'Préférences sont requises.' });
   }
 
   try {
-    saveUserBotPreferences(userId, botId, preferences);
+    await saveUserBotPreferences(userId, botId, preferences);
     res.status(200).json({ message: 'Préférences sauvegardées avec succès.' });
   } catch (error) {
     console.error('Erreur lors de la sauvegarde des préférences:', error);
@@ -805,13 +1013,13 @@ app.post('/api/bot-preferences', isAuthenticated, (req, res) => {
 });
 
 // Modifier la route pour récupérer les conversations afin d'inclure les préférences
-app.get('/api/conversations/:botId', isAuthenticated, (req, res) => {
+app.get('/api/conversations/:botId', authenticateJWT, async (req, res) => {
   const userId = req.user.id;
-  const botId = Number(req.params.botId);
+  const botId = Number(req.params.botId) || 1; // On force le bot islamique
 
   try {
-    const conversations = getConversationsForUserBot(userId, botId);
-    const preferences = getUserBotPreferences(userId, botId);
+    const conversations = await getConversationsForUserBot(userId, botId);
+    const preferences = await getUserBotPreferences(userId, botId);
     
     res.status(200).json({ conversations, preferences });
   } catch (error) {
@@ -821,25 +1029,25 @@ app.get('/api/conversations/:botId', isAuthenticated, (req, res) => {
 });
 
 // Route pour supprimer une conversation
-app.delete('/api/conversations/:botId/:conversationId', isAuthenticated, async (req, res) => {
+app.delete('/api/conversations/:botId/:conversationId', authenticateJWT, async (req, res) => {
   try {
-    const { botId, conversationId } = req.params;
+    const { conversationId } = req.params;
     const userId = req.user.id;
+    const botId = Number(req.params.botId) || 1; // On force le bot islamique
 
     const success = await deleteConversationMySQL(userId, botId, conversationId);
-
     if (success) {
       res.json({ success: true });
     } else {
-      res.status(404).json({ error: 'Conversation non trouvée' });
+      res.status(404).json({ success: false, message: 'Conversation non trouvée ou non supprimée.' });
     }
   } catch (error) {
-    res.status(500).json({ error: 'Erreur lors de la suppression de la conversation' });
+    res.status(500).json({ message: 'Erreur lors de la suppression de la conversation.' });
   }
 });
 
 // Route pour mettre à jour le titre d'une conversation
-app.put('/api/conversations/:botId/:conversationId/title', isAuthenticated, async (req, res) => {
+app.put('/api/conversations/:botId/:conversationId/title', authenticateJWT, async (req, res) => {
   try {
     const { botId, conversationId } = req.params;
     const userId = req.user.id;
@@ -870,9 +1078,9 @@ app.put('/api/conversations/:botId/:conversationId/title', isAuthenticated, asyn
 });
 
 // Route pour rechercher des messages dans une conversation spécifique
-app.get('/api/messages/:botId/:conversationId/search', isAuthenticated, async (req, res) => {
+app.get('/api/messages/:botId/:conversationId/search', authenticateJWT, async (req, res) => {
   const userId = req.user.id;
-  const botId = parseInt(req.params.botId);
+  const botId = Number(req.params.botId) || 1; // On force le bot islamique
   const conversationId = parseInt(req.params.conversationId);
   const query = req.query.query;
 
@@ -890,7 +1098,7 @@ app.get('/api/messages/:botId/:conversationId/search', isAuthenticated, async (r
 });
 
 // Route pour récupérer l'ID MySQL d'un utilisateur connecté (désormais l'id utilisateur)
-app.get('/api/user/mysql-id', isAuthenticated, async (req, res) => {
+app.get('/api/user/mysql-id', authenticateJWT, async (req, res) => {
   try {
     // Si req.user est un id (string), on le renvoie directement. Sinon, on va le chercher en base.
     let userId = req.user && typeof req.user === 'object' ? req.user.id : req.user;
@@ -904,7 +1112,7 @@ app.get('/api/user/mysql-id', isAuthenticated, async (req, res) => {
 });
 
 // Route pour récupérer les stats utilisateur depuis MySQL
-app.get('/api/user/stats', isAuthenticated, async (req, res) => {
+app.get('/api/user/stats', authenticateJWT, async (req, res) => {
   try {
     const stats = await getUserStats(req.user.id);
     res.json({ success: true, stats });
@@ -917,7 +1125,7 @@ app.get('/api/user/stats', isAuthenticated, async (req, res) => {
 
 
 // Route de test pour forcer la synchronisation d'un utilisateur vers MySQL
-app.get('/api/test/sync-user', isAuthenticated, async (req, res) => {
+app.get('/api/test/sync-user', authenticateJWT, async (req, res) => {
   try {
     console.log('🔄 Test de synchronisation forcée pour:', req.user.name);
     
@@ -952,14 +1160,11 @@ app.get('/api/test/sync-user', isAuthenticated, async (req, res) => {
 });
 
 // Route pour créer une nouvelle conversation
-app.post('/api/conversations', isAuthenticated, async (req, res) => {
+app.post('/api/conversations', authenticateJWT, async (req, res) => {
   try {
     const userId = req.user.id;
-    const { botId, title } = req.body;
-    const usedBotId = botId ? Number(botId) : 1;
-    if (!usedBotId || isNaN(usedBotId)) {
-      return res.status(400).json({ message: 'botId requis et doit être un nombre' });
-    }
+    const { title } = req.body;
+    const usedBotId = 1; // On force le bot islamique
     // Vérifier que le bot existe dans MySQL
     const [bots] = await mysqlPool.execute('SELECT * FROM bots WHERE id = ?', [usedBotId]);
     if (!bots || bots.length === 0) {
@@ -986,7 +1191,7 @@ app.post('/api/conversations', isAuthenticated, async (req, res) => {
 });
 
 // Route de test pour générer des stats sur 30 jours
-app.post('/api/test/generate-stats', isAuthenticated, async (req, res) => {
+app.post('/api/test/generate-stats', authenticateJWT, async (req, res) => {
   try {
     const userId = req.user.id;
     await mysqlPool.execute('DELETE FROM quran_stats WHERE user_id = ?', [userId]);
@@ -997,19 +1202,18 @@ app.post('/api/test/generate-stats', isAuthenticated, async (req, res) => {
       const date = new Date(Date.now() - i * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
       values.push([userId, date, 100 + i * 10, 2 + i, 0, 0]);
     }
-    // Insertion en une seule requête
     await mysqlPool.query(
       'INSERT INTO quran_stats (user_id, date, hasanat, verses, time_seconds, pages_read) VALUES ?',
       [values]
     );
-    res.json({ success: true, message: 'Stats de test générées pour 30 jours.' });
+    res.json({ success: true, message: 'Stats générées pour 30 jours.' });
   } catch (error) {
-    res.status(500).json({ success: false, message: 'Erreur lors de la génération des stats.', error: error.message });
+    res.status(500).json({ message: 'Erreur lors de la génération des stats.' });
   }
 });
 
 // Stats du jour
-app.get('/api/user/stats/today', isAuthenticated, async (req, res) => {
+app.get('/api/user/stats/today', authenticateJWT, async (req, res) => {
   try {
     const userId = req.user.id;
     const [rows] = await mysqlPool.execute(
@@ -1028,7 +1232,8 @@ app.get('/api/user/stats/today', isAuthenticated, async (req, res) => {
 });
 
 // Stats de la semaine
-app.get('/api/user/stats/week', isAuthenticated, async (req, res) => {
+app.get('/api/user/stats/week', authenticateJWT, async (req, res) => {
+  console.log('Route /api/user/stats/week - req.user:', req.user);
   try {
     const userId = req.user.id;
     const [rows] = await mysqlPool.execute(
@@ -1047,7 +1252,8 @@ app.get('/api/user/stats/week', isAuthenticated, async (req, res) => {
 });
 
 // Stats totales
-app.get('/api/user/stats/all', isAuthenticated, async (req, res) => {
+app.get('/api/user/stats/all', authenticateJWT, async (req, res) => {
+  console.log('Route /api/user/stats/all - req.user:', req.user);
   try {
     const userId = req.user.id;
     const [rows] = await mysqlPool.execute(
@@ -1066,7 +1272,8 @@ app.get('/api/user/stats/all', isAuthenticated, async (req, res) => {
 });
 
 // Route pour récupérer les stats journalières des 30 derniers jours pour l'utilisateur connecté
-app.get('/api/user/stats/daily', isAuthenticated, async (req, res) => {
+app.get('/api/user/stats/daily', authenticateJWT, async (req, res) => {
+  console.log('Route /api/user/stats/daily - req.user:', req.user);
   try {
     const userId = req.user.id;
     const [rows] = await mysqlPool.execute(
@@ -1091,7 +1298,8 @@ app.get('/api/user/stats/daily', isAuthenticated, async (req, res) => {
 
 // ===================== ROUTES PREFERENCES UTILISATEUR =====================
 // Récupérer les préférences de l'utilisateur connecté
-app.get('/api/user/preferences', isAuthenticated, async (req, res) => {
+app.get('/api/user/preferences', authenticateJWT, async (req, res) => {
+  console.log('Route /api/user/preferences - req.user:', req.user);
   try {
     const userId = req.user.id;
     const [rows] = await mysqlPool.execute(
@@ -1107,7 +1315,7 @@ app.get('/api/user/preferences', isAuthenticated, async (req, res) => {
   }
 });
 // Mettre à jour les préférences de l'utilisateur connecté
-app.put('/api/user/preferences', isAuthenticated, async (req, res) => {
+app.put('/api/user/preferences', authenticateJWT, async (req, res) => {
   try {
     const userId = req.user.id;
     const { preferences } = req.body;
@@ -1125,23 +1333,31 @@ app.put('/api/user/preferences', isAuthenticated, async (req, res) => {
 });
 
 // Route pour récupérer l'historique des messages d'une conversation (MySQL)
-app.get('/api/conversations/:conversationId/messages', isAuthenticated, async (req, res) => {
+app.get('/api/conversations/:conversationId/messages', authenticateJWT, async (req, res) => {
   const { conversationId } = req.params;
   try {
+    // Optionnel : vérifier que la conversation appartient à l'utilisateur
+    const [convs] = await mysqlPool.execute('SELECT * FROM conversations WHERE id = ? AND userId = ?', [conversationId, req.user.id]);
+    if (!convs.length) {
+      return res.status(403).json({ message: 'Accès interdit à cette conversation.' });
+    }
     const [rows] = await mysqlPool.execute(
       'SELECT * FROM messages WHERE conversationId = ? ORDER BY timestamp ASC',
       [conversationId]
     );
     res.json(rows);
   } catch (error) {
-    res.status(500).json({ message: 'Erreur lors de la récupération des messages.' });
+    res.status(500).json({ message: 'Erreur lors de la récupération des messages' });
   }
 });
 
 // Route pour récupérer tous les messages d'un utilisateur, groupés par conversationId
-app.get('/api/user/:userId/messages', isAuthenticated, async (req, res) => {
-  const { userId } = req.params;
+app.get('/api/user/:userId/messages', authenticateJWT, async (req, res) => {
+  if (req.user.id !== req.params.userId) {
+    return res.status(403).json({ message: 'Accès interdit' });
+  }
   try {
+    const { userId } = req.params;
     const [rows] = await mysqlPool.execute(
       'SELECT * FROM messages WHERE userId = ? OR (sender = "bot" AND conversationId IN (SELECT id FROM conversations WHERE userId = ?)) ORDER BY conversationId, timestamp ASC',
       [userId, userId]
@@ -1153,12 +1369,14 @@ app.get('/api/user/:userId/messages', isAuthenticated, async (req, res) => {
 });
 
 // Route pour récupérer toutes les conversations d'un utilisateur
-app.get('/api/user/:userId/conversations', isAuthenticated, async (req, res) => {
-  const { userId } = req.params;
+app.get('/api/user/:userId/conversations', authenticateJWT, async (req, res) => {
+  if (req.user.id !== req.params.userId) {
+    return res.status(403).json({ message: 'Accès interdit' });
+  }
   try {
     const [rows] = await mysqlPool.execute(
       'SELECT * FROM conversations WHERE userId = ? ORDER BY createdAt DESC',
-      [userId]
+      [req.params.userId]
     );
     res.json(rows);
   } catch (error) {
@@ -1166,10 +1384,117 @@ app.get('/api/user/:userId/conversations', isAuthenticated, async (req, res) => 
   }
 });
 
+// ===================== ROUTE MISE À JOUR PROFIL UTILISATEUR =====================
+app.put('/api/user/profile', authenticateJWT, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { username, profile_picture } = req.body;
+    console.log('--- [UPDATE PROFILE] ---');
+    console.log('userId:', userId);
+    console.log('username:', username);
+    console.log('profile_picture:', profile_picture ? '[image]' : null);
+    if (!username && !profile_picture) {
+      return res.status(400).json({ success: false, message: 'Aucune donnée à mettre à jour.' });
+    }
+    const fields = [];
+    const values = [];
+    if (username) {
+      fields.push('username = ?');
+      values.push(username);
+    }
+    if (profile_picture) {
+      fields.push('profile_picture = ?');
+      values.push(profile_picture);
+    }
+    if (fields.length === 0) {
+      return res.status(400).json({ success: false, message: 'Aucune donnée à mettre à jour.' });
+    }
+    values.push(userId);
+    const [result] = await mysqlPool.execute(
+      `UPDATE users SET ${fields.join(', ')} WHERE id = ?`,
+      values
+    );
+    console.log('Résultat SQL:', result);
+    res.json({ success: true, message: 'Profil mis à jour.' });
+  } catch (error) {
+    console.error('Erreur update profile:', error);
+    res.status(500).json({ success: false, message: 'Erreur lors de la mise à jour du profil.', error: error.message });
+  }
+});
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 // Servir les fichiers statiques du build React
+
+// ================== ADMIN ENDPOINTS ==================
+// Liste des utilisateurs
+app.get('/admin/users', authenticateJWT, requireAdmin, async (req, res) => {
+  try {
+    const [rows] = await mysqlPool.query('SELECT id, email, username, chatbotMessagesUsed, is_active FROM users');
+    res.json({ users: rows });
+  } catch (e) {
+    res.status(500).json({ error: 'Erreur SQL users' });
+  }
+});
+// Reset quota utilisateur
+app.post('/admin/users/:userId/reset-quota', authenticateJWT, requireAdmin, async (req, res) => {
+  try {
+    const DEFAULT_QUOTA = 0; // Remettre à zéro
+    await mysqlPool.query('UPDATE users SET chatbotMessagesUsed = ? WHERE id = ?', [DEFAULT_QUOTA, req.params.userId]);
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Erreur SQL reset quota' });
+  }
+});
+// Voir achats d'un utilisateur
+app.get('/admin/users/:userId/purchases', authenticateJWT, requireAdmin, async (req, res) => {
+  try {
+    const [rows] = await mysqlPool.query('SELECT * FROM purchases WHERE user_id = ?', [req.params.userId]);
+    res.json({ purchases: rows });
+  } catch (e) {
+    res.status(500).json({ error: 'Erreur SQL purchases user' });
+  }
+});
+// Liste des achats
+app.get('/admin/purchases', authenticateJWT, requireAdmin, async (req, res) => {
+  try {
+    const [rows] = await mysqlPool.query('SELECT * FROM purchases');
+    res.json({ purchases: rows });
+  } catch (e) {
+    res.status(500).json({ error: 'Erreur SQL purchases' });
+  }
+});
+// Liste des bots
+app.get('/admin/bots', authenticateJWT, requireAdmin, async (req, res) => {
+  try {
+    const [rows] = await mysqlPool.query('SELECT id, name, is_active, (SELECT COUNT(*) FROM user_bots WHERE bot_id = bots.id) AS usersCount FROM bots');
+    res.json({ bots: rows });
+  } catch (e) {
+    res.status(500).json({ error: 'Erreur SQL bots' });
+  }
+});
+// Activer/désactiver un bot
+app.post('/admin/bots/:botId/toggle', authenticateJWT, requireAdmin, async (req, res) => {
+  try {
+    await mysqlPool.query('UPDATE bots SET is_active = NOT is_active WHERE id = ?', [req.params.botId]);
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: 'Erreur SQL toggle bot' });
+  }
+});
+// Statistiques globales
+app.get('/admin/stats', authenticateJWT, requireAdmin, async (req, res) => {
+  try {
+    const [[{ users }]] = await mysqlPool.query('SELECT COUNT(*) AS users FROM users');
+    const [[{ bots }]] = await mysqlPool.query('SELECT COUNT(*) AS bots FROM bots');
+    const [[{ purchases }]] = await mysqlPool.query('SELECT COUNT(*) AS purchases FROM purchases');
+    const [[{ hasanat }]] = await mysqlPool.query('SELECT SUM(hasanat) AS hasanat FROM quran_stats');
+    res.json({ users, bots, purchases, hasanat: hasanat || 0 });
+  } catch (e) {
+    res.status(500).json({ error: 'Erreur SQL stats' });
+  }
+}); 
 
 // Fallback SPA : toutes les autres routes renvoient index.html
 app.get('*', (req, res) => {
@@ -1179,4 +1504,58 @@ app.get('*', (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Serveur backend démarré sur le port ${PORT}`);
+}); 
+
+// Route temporaire pour générer un JWT admin (à supprimer après usage)
+app.get('/admin/generate-token', (req, res) => {
+  const { secret } = req.query;
+  // Change la valeur ci-dessous pour plus de sécurité
+  if (secret !== 'GEN_TOKEN_2025') {
+    return res.status(403).json({ error: 'Accès refusé' });
+  }
+  const payload = {
+    id: 'admin-id', // Remplace par l'id réel si besoin
+    email: 'mohammadharris200528@gmail.com'
+  };
+  const JWT_SECRET = process.env.JWT_SECRET || 'une_clé_ultra_secrète';
+  const token = jwt.sign(payload, JWT_SECRET, { expiresIn: '7d' });
+  res.json({ token });
+}); 
+
+// Route permanente pour login admin sécurisé
+app.post('/admin/login', async (req, res) => {
+  const { email, password } = req.body;
+  if (
+    email === 'mohammadharris200528@gmail.com' &&
+    password === process.env.ADMIN_PASSWORD
+  ) {
+    const payload = {
+      id: 'admin-id', // Mets l'id réel si tu veux
+      email
+    };
+    const JWT_SECRET = process.env.JWT_SECRET || 'une_clé_ultra_secrète';
+    const token = jwt.sign(payload, JWT_SECRET, { expiresIn: '7d' });
+    return res.json({ token });
+  }
+  return res.status(403).json({ error: 'Identifiants invalides' });
+}); 
+
+app.post('/auth/mobile', async (req, res) => {
+  const { idToken } = req.body;
+  if (!idToken) return res.status(400).json({ message: 'Token manquant' });
+  try {
+    const ticket = await googleClient.verifyIdToken({
+      idToken,
+      audience: process.env.GOOGLE_CLIENT_ID,
+    });
+    const payload = ticket.getPayload();
+    // payload.sub = Google user ID
+    // payload.email, payload.name, payload.picture
+    const user = await findOrCreateUser(payload.sub, payload.name, payload.email, payload.picture);
+    // Générer un JWT maison
+    const token = jwt.sign({ id: user.id }, JWT_SECRET, { expiresIn: '30d' });
+    res.json({ token, user });
+  } catch (err) {
+    res.status(401).json({ message: 'Token Google invalide', error: err.message });
+  }
 }); 
